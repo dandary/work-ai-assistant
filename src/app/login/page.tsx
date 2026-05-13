@@ -98,7 +98,7 @@ function LoginForm() {
 
 export default function LoginPage() {
   return (
-    <div className="flex min-h-full flex-1 flex-col items-center justify-center px-4 py-12">
+    <div className="flex min-h-dvh flex-1 flex-col items-center justify-center px-4 py-8 sm:py-12">
       <Suspense
         fallback={
           <div className="w-full max-w-sm animate-pulse rounded-2xl border border-zinc-200 bg-zinc-50 p-8 text-center text-sm text-zinc-500 dark:border-zinc-700 dark:bg-zinc-900">

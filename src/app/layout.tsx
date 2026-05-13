@@ -19,6 +19,12 @@ export const metadata: Metadata = {
     "Помощник для писем и задач через Cerebras AI (OpenAI-совместимый API)",
 };
 
+export const viewport = {
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+
 export default function RootLayout({
   children,
 }: Readonly<{
@@ -29,7 +35,7 @@ export default function RootLayout({
       lang="ru"
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
     >
-      <body className="flex min-h-full flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50">
+      <body className="flex min-h-dvh flex-col bg-zinc-100 text-zinc-900 dark:bg-zinc-900 dark:text-zinc-50">
         <Providers>{children}</Providers>
       </body>
     </html>
