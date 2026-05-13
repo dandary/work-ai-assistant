@@ -30,7 +30,7 @@ yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
 
-# env files (секреты локально)
+# Переменные окружения с секретами: .env, .env.local и др. Шаблон .env.example в репозитории.
 .env*
 !.env.example
 
