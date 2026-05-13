@@ -19,7 +19,7 @@ const chatMessageSchema = z.object({
 });
 
 export const assistantRequestSchema = z.object({
-  conversationId: z.string().cuid("Некорректный идентификатор чата"),
+  conversationId: z.string().cuid("Некорректный идентификатор чата").optional(),
   preset: z.string().optional(),
   model: z.string().optional(),
   messages: z

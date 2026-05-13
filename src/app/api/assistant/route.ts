@@ -42,6 +42,17 @@ function getApiKey(): string | undefined {
   return trimEnvValue(process.env.CEREBRAS_API_KEY);
 }
 
+function getClientIp(request: Request): string {
+  const xf = request.headers.get("x-forwarded-for");
+  if (xf) {
+    const first = xf.split(",")[0]?.trim();
+    if (first) return first;
+  }
+  const realIp = request.headers.get("x-real-ip");
+  if (realIp?.trim()) return realIp.trim();
+  return "unknown";
+}
+
 type ChatMessage = { role: "user" | "assistant"; content: string };
 
 function isPresetId(value: unknown): value is WorkPresetId {
@@ -155,12 +166,6 @@ export async function POST(request: Request) {
   const requestId = crypto.randomUUID();
 
   const session = await getServerSession(authOptions);
-  if (!session?.user?.id) {
-    return NextResponse.json(
-      { error: "Требуется вход" },
-      { status: 401, headers: { "X-Request-Id": requestId } },
-    );
-  }
 
   const apiKey = getApiKey();
   if (!apiKey) {
@@ -197,19 +202,38 @@ export async function POST(request: Request) {
   const { messages, preset, model: bodyModel, conversationId } = parsed.data;
   const normalized: ChatMessage[] = messages;
 
-  const conv = await prisma.conversation.findFirst({
-    where: { id: conversationId, userId: session.user.id },
-  });
-  if (!conv) {
+  if (conversationId && !session?.user?.id) {
     return NextResponse.json(
-      { error: "Чат не найден" },
-      { status: 404, headers: { "X-Request-Id": requestId } },
+      { error: "Войдите, чтобы сохранять чаты в аккаунте." },
+      { status: 401, headers: { "X-Request-Id": requestId } },
     );
+  }
+
+  const persist = Boolean(session?.user?.id && conversationId);
+
+  let conv:
+    | { id: string; title: string; userId: string }
+    | null = null;
+
+  if (persist && session?.user?.id && conversationId) {
+    conv = await prisma.conversation.findFirst({
+      where: { id: conversationId, userId: session.user.id },
+      select: { id: true, title: true, userId: true },
+    });
+    if (!conv) {
+      return NextResponse.json(
+        { error: "Чат не найден" },
+        { status: 404, headers: { "X-Request-Id": requestId } },
+      );
+    }
   }
 
   const rl = parseRateLimit();
   if (!rl.disabled) {
-    const hit = checkRateLimit(`assistant:${session.user.id}`, rl.max, rl.windowMs);
+    const key = session?.user?.id
+      ? `assistant:${session.user.id}`
+      : `assistant:${getClientIp(request)}`;
+    const hit = checkRateLimit(key, rl.max, rl.windowMs);
     if (!hit.ok) {
       return NextResponse.json(
         {
@@ -264,7 +288,7 @@ export async function POST(request: Request) {
   }
 
   const encoder = new TextEncoder();
-  const convTitleSnapshot = conv.title;
+  const convTitleSnapshot = conv?.title ?? "";
 
   return new Response(
     new ReadableStream({
@@ -291,42 +315,44 @@ export async function POST(request: Request) {
           assistantText += suffix;
           controller.enqueue(encoder.encode(suffix));
         } finally {
-          try {
-            const firstUser = normalized.find((m) => m.role === "user");
-            const newTitle =
-              convTitleSnapshot === "Новый чат" &&
-              firstUser &&
-              firstUser.content.trim().length > 0
-                ? firstUser.content.trim().slice(0, 80)
-                : undefined;
+          if (persist && conv && conversationId) {
+            try {
+              const firstUser = normalized.find((m) => m.role === "user");
+              const newTitle =
+                convTitleSnapshot === "Новый чат" &&
+                firstUser &&
+                firstUser.content.trim().length > 0
+                  ? firstUser.content.trim().slice(0, 80)
+                  : undefined;
 
-            await prisma.$transaction(async (tx) => {
-              await tx.message.deleteMany({ where: { conversationId } });
-              await tx.message.createMany({
-                data: [
-                  ...normalized.map((m) => ({
-                    conversationId,
-                    role: m.role,
-                    content: m.content,
-                  })),
-                  {
-                    conversationId,
-                    role: "assistant",
-                    content: assistantText,
+              await prisma.$transaction(async (tx) => {
+                await tx.message.deleteMany({ where: { conversationId } });
+                await tx.message.createMany({
+                  data: [
+                    ...normalized.map((m) => ({
+                      conversationId,
+                      role: m.role,
+                      content: m.content,
+                    })),
+                    {
+                      conversationId,
+                      role: "assistant",
+                      content: assistantText,
+                    },
+                  ],
+                });
+                await tx.conversation.update({
+                  where: { id: conversationId },
+                  data: {
+                    preset: presetId,
+                    modelId: model,
+                    ...(newTitle ? { title: newTitle } : {}),
                   },
-                ],
+                });
               });
-              await tx.conversation.update({
-                where: { id: conversationId },
-                data: {
-                  preset: presetId,
-                  modelId: model,
-                  ...(newTitle ? { title: newTitle } : {}),
-                },
-              });
-            });
-          } catch (persistErr) {
-            console.error("assistant persist", persistErr);
+            } catch (persistErr) {
+              console.error("assistant persist", persistErr);
+            }
           }
           controller.close();
         }

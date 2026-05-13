@@ -1,4 +1,5 @@
 import bcrypt from "bcryptjs";
+import { Prisma } from "@prisma/client";
 import { NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
@@ -30,18 +31,36 @@ export async function POST(request: Request) {
   }
 
   const email = parsed.data.email.toLowerCase().trim();
-  const exists = await prisma.user.findUnique({ where: { email } });
-  if (exists) {
+
+  try {
+    const exists = await prisma.user.findUnique({ where: { email } });
+    if (exists) {
+      return NextResponse.json(
+        { error: "Пользователь с таким email уже зарегистрирован" },
+        { status: 409 },
+      );
+    }
+
+    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+    await prisma.user.create({
+      data: { email, passwordHash },
+    });
+  } catch (e) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2002") {
+      return NextResponse.json(
+        { error: "Пользователь с таким email уже зарегистрирован" },
+        { status: 409 },
+      );
+    }
+    console.error("POST /api/auth/register", e);
     return NextResponse.json(
-      { error: "Пользователь с таким email уже зарегистрирован" },
-      { status: 409 },
+      {
+        error:
+          "Ошибка базы данных. Для продакшена задайте в окружении PostgreSQL (DATABASE_URL), например Neon или Vercel Postgres.",
+      },
+      { status: 503 },
     );
   }
-
-  const passwordHash = await bcrypt.hash(parsed.data.password, 12);
-  await prisma.user.create({
-    data: { email, passwordHash },
-  });
 
   return NextResponse.json({ ok: true });
 }

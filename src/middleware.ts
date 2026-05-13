@@ -8,9 +8,11 @@ export async function middleware(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
   const isPublic =
+    pathname === "/" ||
     pathname === "/login" ||
     pathname === "/register" ||
-    pathname.startsWith("/api/auth/");
+    pathname.startsWith("/api/auth/") ||
+    pathname === "/api/assistant";
 
   if (isPublic) {
     return NextResponse.next();

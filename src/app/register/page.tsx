@@ -73,6 +73,12 @@ export default function RegisterPage() {
             {busy ? "Отправка…" : "Создать аккаунт"}
           </button>
         </form>
+        <Link
+          href="/"
+          className="mt-4 flex w-full justify-center rounded-lg border border-zinc-300 py-2.5 text-sm font-medium text-zinc-700 hover:bg-zinc-50 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-900"
+        >
+          Пользоваться без регистрации
+        </Link>
         <p className="mt-6 text-center text-sm text-zinc-500">
           Уже есть аккаунт?{" "}
           <Link

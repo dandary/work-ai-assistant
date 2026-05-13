@@ -1,11 +1,11 @@
-// Prisma schema — SQLite для локального запуска и простого деплоя
+// PostgreSQL: локально и на Vercel (SQLite на serverless не подходит — файла БД нет).
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useSession, signOut } from "next-auth/react";
+import Link from "next/link";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CEREBRAS_MODEL_IDS,
@@ -100,8 +101,13 @@ export function Workspace() {
   );
 
   useEffect(() => {
-    if (status !== "authenticated") {
+    if (status === "unauthenticated") {
       setBootstrapping(false);
+    }
+  }, [status]);
+
+  useEffect(() => {
+    if (status !== "authenticated") {
       return;
     }
 
@@ -163,6 +169,10 @@ export function Workspace() {
   const createNewChat = useCallback(async () => {
     abortRef.current?.abort();
     setError(null);
+    if (status !== "authenticated") {
+      setMessages([]);
+      return;
+    }
     const res = await fetch("/api/conversations", { method: "POST" });
     if (!res.ok) return;
     const row = (await res.json()) as ConversationListItem;
@@ -171,11 +181,16 @@ export function Workspace() {
     setPreset(parsePresetId(row.preset));
     setModelId(parseModelId(row.modelId));
     setMessages([]);
-  }, []);
+  }, [status]);
 
   const deleteActiveChat = useCallback(async () => {
-    if (!activeConversationId) return;
     abortRef.current?.abort();
+    if (status !== "authenticated") {
+      setMessages([]);
+      setError(null);
+      return;
+    }
+    if (!activeConversationId) return;
     const id = activeConversationId;
     const res = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
       method: "DELETE",
@@ -204,11 +219,14 @@ export function Workspace() {
     activeConversationId,
     loadConversation,
     refetchConversations,
+    status,
   ]);
 
   const send = useCallback(async () => {
     const text = input.trim();
-    if (!text || busy || !activeConversationId) return;
+    if (!text || busy) return;
+    const authed = status === "authenticated";
+    if (authed && !activeConversationId) return;
 
     abortRef.current?.abort();
     const ac = new AbortController();
@@ -227,7 +245,9 @@ export function Workspace() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          conversationId: activeConversationId,
+          ...(authed && activeConversationId
+            ? { conversationId: activeConversationId }
+            : {}),
           preset,
           messages: nextMessages,
           model: modelId,
@@ -266,7 +286,7 @@ export function Workspace() {
         });
         requestAnimationFrame(scrollToBottom);
       }
-      void refetchConversations();
+      if (authed) void refetchConversations();
     } catch (e) {
       if (
         (e instanceof DOMException && e.name === "AbortError") ||
@@ -304,6 +324,7 @@ export function Workspace() {
     scrollToBottom,
     activeConversationId,
     refetchConversations,
+    status,
   ]);
 
   const stop = useCallback(() => {
@@ -330,13 +351,15 @@ export function Workspace() {
     [activeConversationId, patchConversation],
   );
 
-  if (status === "loading" || bootstrapping) {
+  if (status === "loading" || (status === "authenticated" && bootstrapping)) {
     return (
       <div className="flex flex-1 items-center justify-center p-8 text-sm text-zinc-500">
         Загрузка…
       </div>
     );
   }
+
+  const isAuthed = status === "authenticated";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col md:flex-row">
@@ -348,31 +371,41 @@ export function Workspace() {
             disabled={busy}
             className="w-full rounded-lg bg-zinc-900 py-2 text-xs font-medium text-white hover:bg-zinc-800 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900"
           >
-            Новый чат
+            {isAuthed ? "Новый чат" : "Очистить диалог"}
           </button>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto p-2">
           <p className="px-2 text-xs font-medium uppercase tracking-wide text-zinc-500">
             Чаты
           </p>
-          <ul className="mt-2 space-y-1">
-            {conversations.map((c) => (
-              <li key={c.id}>
-                <button
-                  type="button"
-                  onClick={() => void selectConversation(c.id)}
-                  disabled={busy}
-                  className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
-                    c.id === activeConversationId
-                      ? "bg-zinc-200 font-medium dark:bg-zinc-800"
-                      : "text-zinc-700 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800/80"
-                  }`}
-                >
-                  <span className="line-clamp-2">{c.title}</span>
-                </button>
-              </li>
-            ))}
-          </ul>
+          {!isAuthed ? (
+            <p className="mt-2 px-2 text-xs leading-relaxed text-zinc-500">
+              Без входа диалог не сохраняется.{" "}
+              <Link className="font-medium text-zinc-800 underline dark:text-zinc-200" href="/login">
+                Войти
+              </Link>{" "}
+              — история в облаке.
+            </p>
+          ) : (
+            <ul className="mt-2 space-y-1">
+              {conversations.map((c) => (
+                <li key={c.id}>
+                  <button
+                    type="button"
+                    onClick={() => void selectConversation(c.id)}
+                    disabled={busy}
+                    className={`w-full rounded-lg px-2 py-2 text-left text-sm ${
+                      c.id === activeConversationId
+                        ? "bg-zinc-200 font-medium dark:bg-zinc-800"
+                        : "text-zinc-700 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800/80"
+                    }`}
+                  >
+                    <span className="line-clamp-2">{c.title}</span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
         <div className="border-t border-zinc-200 p-4 dark:border-zinc-800">
           <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -437,21 +470,40 @@ export function Workspace() {
                 Стоп
               </button>
             )}
-            <button
-              type="button"
-              onClick={() => void deleteActiveChat()}
-              disabled={busy || !activeConversationId}
-              className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
-            >
-              Удалить чат
-            </button>
-            <button
-              type="button"
-              onClick={() => void signOut({ callbackUrl: "/login" })}
-              className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
-            >
-              Выйти
-            </button>
+            {isAuthed && (
+              <button
+                type="button"
+                onClick={() => void deleteActiveChat()}
+                disabled={busy || !activeConversationId}
+                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                Удалить чат
+              </button>
+            )}
+            {isAuthed ? (
+              <button
+                type="button"
+                onClick={() => void signOut({ callbackUrl: "/" })}
+                className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+              >
+                Выйти
+              </button>
+            ) : (
+              <>
+                <Link
+                  href="/login"
+                  className="rounded-lg border border-zinc-300 px-3 py-1.5 text-xs font-medium text-zinc-700 hover:bg-zinc-100 dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  Войти
+                </Link>
+                <Link
+                  href="/register"
+                  className="rounded-lg bg-zinc-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-zinc-800 dark:bg-zinc-100 dark:text-zinc-900"
+                >
+                  Регистрация
+                </Link>
+              </>
+            )}
           </div>
         </header>
 
@@ -508,7 +560,7 @@ export function Workspace() {
               rows={3}
               placeholder="Ваш запрос или вставьте текст встречи…"
               className="min-h-[5rem] flex-1 resize-y rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 outline-none ring-zinc-400 focus:ring-2 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
-              disabled={busy || !activeConversationId}
+              disabled={busy || (isAuthed && !activeConversationId)}
             />
             <div className="flex shrink-0 gap-2 self-end">
               {busy && (
@@ -523,7 +575,7 @@ export function Workspace() {
               <button
                 type="button"
                 onClick={() => void send()}
-                disabled={busy || !input.trim() || !activeConversationId}
+                disabled={busy || !input.trim() || (isAuthed && !activeConversationId)}
                 className="rounded-xl bg-zinc-900 px-4 py-2 text-sm font-medium text-white hover:bg-zinc-800 disabled:opacity-40 dark:bg-zinc-100 dark:text-zinc-900 dark:hover:bg-zinc-200"
               >
                 {busy ? "…" : "Отправить"}
