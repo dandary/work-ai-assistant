@@ -16,6 +16,7 @@ model User {
   passwordHash String
   createdAt    DateTime       @default(now())
   conversations Conversation[]
+  passwordResetTokens PasswordResetToken[]
 }
 
 model Conversation {
@@ -25,11 +26,14 @@ model Conversation {
   title     String    @default("Новый чат")
   preset    String    @default("email")
   modelId   String    @default("llama3.1-8b")
+  summary   String?
+  deletedAt DateTime?
   createdAt DateTime  @default(now())
   updatedAt DateTime  @updatedAt
   messages  Message[]
 
   @@index([userId, updatedAt])
+  @@index([userId, deletedAt])
 }
 
 model Message {
@@ -42,3 +46,16 @@ model Message {
 
   @@index([conversationId, createdAt])
 }
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  tokenHash String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+

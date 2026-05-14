@@ -8,20 +8,41 @@ import {
   CEREBRAS_MODELS,
   DEFAULT_CEREBRAS_MODEL,
 } from "@/lib/cerebras-models";
+import { ASSISTANT_MAX_MESSAGE_CHARS } from "@/lib/assistant-request";
 import {
   DEFAULT_PRESET,
   WORK_PRESETS,
   type WorkPresetId,
 } from "@/lib/presets";
 
-type ChatMessage = { role: "user" | "assistant"; content: string };
+type ChatMessage = { id?: string; role: "user" | "assistant"; content: string };
 
 type ConversationListItem = {
   id: string;
   title: string;
   preset: string;
   modelId: string;
+  updatedAt?: string;
 };
+
+function stripForApi(msgs: ChatMessage[]): Pick<ChatMessage, "role" | "content">[] {
+  return msgs.map(({ role, content }) => ({ role, content }));
+}
+
+function messagesToMarkdown(msgs: ChatMessage[]): string {
+  return msgs
+    .filter((m) => m.content.trim())
+    .map((m) => `### ${m.role === "user" ? "Пользователь" : "Ассистент"}\n\n${m.content}`)
+    .join("\n\n---\n\n");
+}
+
+function fmtListDate(iso?: string): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime())
+    ? ""
+    : d.toLocaleString("ru-RU", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
+}
 
 function parsePresetId(raw: string | undefined): WorkPresetId {
   if (raw && raw in WORK_PRESETS) return raw as WorkPresetId;
@@ -41,16 +62,22 @@ export function Workspace() {
   const [busy, setBusy] = useState(false);
   const [modelId, setModelId] = useState(DEFAULT_CEREBRAS_MODEL);
   const [error, setError] = useState<string | null>(null);
-  const [conversations, setConversations] = useState<ConversationListItem[]>(
-    [],
+  const [conversations, setConversations] = useState<ConversationListItem[]>([]);
+  const [chatQuery, setChatQuery] = useState("");
+  const [hasMoreOlder, setHasMoreOlder] = useState(false);
+  const [oldestMessageId, setOldestMessageId] = useState<string | null>(null);
+  const [loadingOlder, setLoadingOlder] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [filePasteHint, setFilePasteHint] = useState<string | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(
+    null,
   );
-  const [activeConversationId, setActiveConversationId] = useState<
-    string | null
-  >(null);
   const [bootstrapping, setBootstrapping] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const presetList = useMemo(
     () =>
@@ -65,8 +92,10 @@ export function Workspace() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, []);
 
-  const refetchConversations = useCallback(async () => {
-    const res = await fetch("/api/conversations");
+  const refetchConversations = useCallback(async (query?: string) => {
+    const q = typeof query === "string" ? query.trim() : "";
+    const qs = q ? `?q=${encodeURIComponent(q)}` : "";
+    const res = await fetch(`/api/conversations${qs}`);
     if (!res.ok) return;
     const data = (await res.json()) as { conversations?: ConversationListItem[] };
     const list = data.conversations ?? [];
@@ -79,23 +108,39 @@ export function Workspace() {
       preset?: string;
       modelId?: string;
       messages?: ChatMessage[];
+      hasMoreOlder?: boolean;
+      oldestMessageId?: string | null;
     }) => {
       setPreset(parsePresetId(data.preset));
       setModelId(parseModelId(data.modelId));
       setMessages(Array.isArray(data.messages) ? data.messages : []);
+      setHasMoreOlder(Boolean(data.hasMoreOlder));
+      setOldestMessageId(data.oldestMessageId ?? null);
     },
     [],
   );
 
   const loadConversation = useCallback(
     async (id: string) => {
-      const res = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+      const res = await fetch(`/api/conversations/${encodeURIComponent(id)}?limit=120`);
       if (!res.ok) return;
       const data = (await res.json()) as {
+        prepend?: boolean;
         preset?: string;
         modelId?: string;
         messages?: ChatMessage[];
+        hasMoreOlder?: boolean;
+        oldestMessageId?: string | null;
       };
+
+      if (data.prepend) {
+        const block = Array.isArray(data.messages) ? data.messages : [];
+        setMessages((prev) => [...block, ...prev]);
+        setHasMoreOlder(Boolean(data.hasMoreOlder));
+        setOldestMessageId(data.oldestMessageId ?? null);
+        return;
+      }
+
       applyConversationPayload(data);
     },
     [applyConversationPayload],
@@ -108,6 +153,14 @@ export function Workspace() {
   }, [status]);
 
   useEffect(() => {
+    if (status !== "authenticated") return;
+    const t = setTimeout(() => {
+      void refetchConversations(chatQuery);
+    }, 320);
+    return () => clearTimeout(t);
+  }, [chatQuery, status, refetchConversations]);
+
+  useEffect(() => {
     if (status !== "authenticated") {
       return;
     }
@@ -116,7 +169,7 @@ export function Workspace() {
     (async () => {
       setBootstrapping(true);
       try {
-        let list = await refetchConversations();
+        let list = await refetchConversations(chatQuery);
         if (cancelled) return;
         if (!list || list.length === 0) {
           const created = await fetch("/api/conversations", {
@@ -129,6 +182,8 @@ export function Workspace() {
           setPreset(parsePresetId(row.preset));
           setModelId(parseModelId(row.modelId));
           setMessages([]);
+          setHasMoreOlder(false);
+          setOldestMessageId(null);
           return;
         }
         const first = list[0]!;
@@ -142,7 +197,9 @@ export function Workspace() {
     return () => {
       cancelled = true;
     };
-  }, [status, refetchConversations, loadConversation]);
+    // только при первом входе / сессии — не триггерим при каждом chatQuery (есть отдельный debounce)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [status, loadConversation, refetchConversations]);
 
   const patchConversation = useCallback(
     async (id: string, body: { title?: string; preset?: string; modelId?: string }) => {
@@ -151,9 +208,9 @@ export function Workspace() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
       });
-      void refetchConversations();
+      await refetchConversations(chatQuery);
     },
-    [refetchConversations],
+    [refetchConversations, chatQuery],
   );
 
   const selectConversation = useCallback(
@@ -162,6 +219,7 @@ export function Workspace() {
       abortRef.current?.abort();
       setActiveConversationId(id);
       setError(null);
+      setRenamingId(null);
       await loadConversation(id);
       setNavOpen(false);
     },
@@ -173,6 +231,8 @@ export function Workspace() {
     setError(null);
     if (status !== "authenticated") {
       setMessages([]);
+      setHasMoreOlder(false);
+      setOldestMessageId(null);
       setNavOpen(false);
       return;
     }
@@ -184,6 +244,9 @@ export function Workspace() {
     setPreset(parsePresetId(row.preset));
     setModelId(parseModelId(row.modelId));
     setMessages([]);
+    setHasMoreOlder(false);
+    setOldestMessageId(null);
+    setRenamingId(null);
     setNavOpen(false);
   }, [status]);
 
@@ -192,6 +255,8 @@ export function Workspace() {
     if (status !== "authenticated") {
       setMessages([]);
       setError(null);
+      setHasMoreOlder(false);
+      setOldestMessageId(null);
       return;
     }
     if (!activeConversationId) return;
@@ -200,7 +265,8 @@ export function Workspace() {
       method: "DELETE",
     });
     if (!res.ok) return;
-    const list = await refetchConversations();
+    const list = await refetchConversations(chatQuery);
+    setRenamingId(null);
     if (list && list.length > 0) {
       const next = list[0]!;
       setActiveConversationId(next.id);
@@ -212,19 +278,35 @@ export function Workspace() {
         setConversations([row]);
         setActiveConversationId(row.id);
         setMessages([]);
+        setHasMoreOlder(false);
+        setOldestMessageId(null);
         setPreset(parsePresetId(row.preset));
         setModelId(parseModelId(row.modelId));
       } else {
         setActiveConversationId(null);
         setMessages([]);
+        setHasMoreOlder(false);
+        setOldestMessageId(null);
       }
     }
   }, [
     activeConversationId,
     loadConversation,
     refetchConversations,
+    chatQuery,
     status,
   ]);
+
+  useEffect(() => {
+    const authedGuest = status === "unauthenticated" && input.trim().length > 0;
+    if (!authedGuest) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [input, status]);
 
   const send = useCallback(async () => {
     const text = input.trim();
@@ -249,11 +331,9 @@ export function Workspace() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...(authed && activeConversationId
-            ? { conversationId: activeConversationId }
-            : {}),
+          ...(authed && activeConversationId ? { conversationId: activeConversationId } : {}),
           preset,
-          messages: nextMessages,
+          messages: stripForApi(nextMessages),
           model: modelId,
         }),
         signal: ac.signal,
@@ -290,7 +370,24 @@ export function Workspace() {
         });
         requestAnimationFrame(scrollToBottom);
       }
-      if (authed) void refetchConversations();
+      if (authed) {
+        await refetchConversations(chatQuery);
+        if (activeConversationId) {
+          const r = await fetch(
+            `/api/conversations/${encodeURIComponent(activeConversationId)}?limit=120`,
+          );
+          if (r.ok) {
+            const d = (await r.json()) as {
+              messages?: ChatMessage[];
+              hasMoreOlder?: boolean;
+              oldestMessageId?: string | null;
+            };
+            setMessages(Array.isArray(d.messages) ? d.messages : []);
+            setHasMoreOlder(Boolean(d.hasMoreOlder));
+            setOldestMessageId(d.oldestMessageId ?? null);
+          }
+        }
+      }
     } catch (e) {
       if (
         (e instanceof DOMException && e.name === "AbortError") ||
@@ -328,7 +425,43 @@ export function Workspace() {
     scrollToBottom,
     activeConversationId,
     refetchConversations,
+    chatQuery,
     status,
+  ]);
+
+  const loadOlder = useCallback(async () => {
+    if (
+      !activeConversationId ||
+      !oldestMessageId ||
+      loadingOlder ||
+      !hasMoreOlder ||
+      busy
+    ) {
+      return;
+    }
+    setLoadingOlder(true);
+    try {
+      const url = `/api/conversations/${encodeURIComponent(activeConversationId)}?before=${encodeURIComponent(oldestMessageId)}&limit=80`;
+      const res = await fetch(url);
+      if (!res.ok) return;
+      const data = (await res.json()) as {
+        messages?: ChatMessage[];
+        hasMoreOlder?: boolean;
+        oldestMessageId?: string | null;
+      };
+      const block = data.messages ?? [];
+      setMessages((prev) => [...block, ...prev]);
+      setHasMoreOlder(Boolean(data.hasMoreOlder));
+      setOldestMessageId(data.oldestMessageId ?? oldestMessageId);
+    } finally {
+      setLoadingOlder(false);
+    }
+  }, [
+    activeConversationId,
+    hasMoreOlder,
+    loadingOlder,
+    oldestMessageId,
+    busy,
   ]);
 
   const stop = useCallback(() => {
@@ -355,6 +488,58 @@ export function Workspace() {
     [activeConversationId, patchConversation],
   );
 
+  const copyDialog = useCallback(async () => {
+    const md = messagesToMarkdown(messages);
+    try {
+      await navigator.clipboard.writeText(md || "");
+      setFilePasteHint(md ? "Скопировано в буфер" : "Нечего копировать");
+      setTimeout(() => setFilePasteHint(null), 2000);
+    } catch {
+      setFilePasteHint("Не удалось скопировать");
+      setTimeout(() => setFilePasteHint(null), 2000);
+    }
+  }, [messages]);
+
+  const exportMarkdown = useCallback(() => {
+    const md = messagesToMarkdown(messages);
+    if (!md.trim()) return;
+    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+    const u = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = u;
+    a.download = `chat-${activeConversationId ?? "export"}-${Date.now()}.md`;
+    a.click();
+    URL.revokeObjectURL(u);
+  }, [messages, activeConversationId]);
+
+  const onPickFile = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0];
+    e.target.value = "";
+    if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      let t = typeof reader.result === "string" ? reader.result : "";
+      if (t.length > ASSISTANT_MAX_MESSAGE_CHARS) {
+        t = t.slice(0, ASSISTANT_MAX_MESSAGE_CHARS);
+        setFilePasteHint(`Вставлено ${ASSISTANT_MAX_MESSAGE_CHARS.toLocaleString()} символов (лимит)`);
+      } else {
+        setFilePasteHint(`Файл «${f.name}» добавлен в поле`);
+      }
+      setInput((prev) => (prev ? `${prev}\n\n${t}` : t));
+      setTimeout(() => setFilePasteHint(null), 4000);
+    };
+    reader.readAsText(f, "UTF-8");
+  }, []);
+
+  const saveRename = useCallback(async () => {
+    if (!renamingId || !renameDraft.trim()) {
+      setRenamingId(null);
+      return;
+    }
+    await patchConversation(renamingId, { title: renameDraft.trim() });
+    setRenamingId(null);
+  }, [renamingId, renameDraft, patchConversation]);
+
   if (status === "loading" || (status === "authenticated" && bootstrapping)) {
     return (
       <div className="flex flex-1 items-center justify-center p-8 text-sm text-zinc-500">
@@ -367,6 +552,14 @@ export function Workspace() {
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row">
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept=".txt,.md,text/plain"
+        className="hidden"
+        onChange={onPickFile}
+      />
+
       {navOpen && (
         <button
           type="button"
@@ -391,19 +584,8 @@ export function Workspace() {
             onClick={() => setNavOpen(false)}
             aria-label="Закрыть"
           >
-            <svg
-              className="h-5 w-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              aria-hidden
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M6 18L18 6M6 6l12 12"
-              />
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
@@ -421,6 +603,18 @@ export function Workspace() {
           <p className="px-2 text-xs font-medium uppercase tracking-wide text-zinc-500">
             Чаты
           </p>
+          {isAuthed && (
+            <label className="mt-2 block px-2 text-xs">
+              <span className="sr-only">Поиск чатов</span>
+              <input
+                type="search"
+                value={chatQuery}
+                onChange={(e) => setChatQuery(e.target.value)}
+                placeholder="Поиск по названию…"
+                className="w-full rounded-lg border border-zinc-300 bg-white px-2 py-2 text-xs text-zinc-900 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-100"
+              />
+            </label>
+          )}
           {!isAuthed ? (
             <p className="mt-2 px-2 text-xs leading-relaxed text-zinc-500">
               Без входа диалог не сохраняется.{" "}
@@ -433,18 +627,75 @@ export function Workspace() {
             <ul className="mt-2 space-y-1">
               {conversations.map((c) => (
                 <li key={c.id}>
-                  <button
-                    type="button"
-                    onClick={() => void selectConversation(c.id)}
-                    disabled={busy}
-                    className={`touch-manipulation w-full rounded-lg px-2 py-2.5 text-left text-sm ${
-                      c.id === activeConversationId
-                        ? "bg-zinc-200 font-medium dark:bg-zinc-800"
-                        : "text-zinc-700 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800/80"
-                    }`}
-                  >
-                    <span className="line-clamp-2">{c.title}</span>
-                  </button>
+                  <div className="flex items-start gap-1">
+                    <button
+                      type="button"
+                      onClick={() => void selectConversation(c.id)}
+                      disabled={busy || renamingId === c.id}
+                      className={`touch-manipulation min-w-0 flex-1 rounded-lg px-2 py-2 text-left text-sm ${
+                        c.id === activeConversationId
+                          ? "bg-zinc-200 font-medium dark:bg-zinc-800"
+                          : "text-zinc-700 hover:bg-zinc-200/70 dark:text-zinc-300 dark:hover:bg-zinc-800/80"
+                      }`}
+                    >
+                      {renamingId === c.id ? (
+                        <div className="flex flex-col gap-1" onClick={(e) => e.stopPropagation()}>
+                          <input
+                            autoFocus
+                            value={renameDraft}
+                            onChange={(e) => setRenameDraft(e.target.value)}
+                            className="w-full rounded border border-zinc-400 bg-white px-1 py-0.5 text-xs dark:bg-zinc-900"
+                          />
+                          <span className="flex gap-1">
+                            <button
+                              type="button"
+                              className="rounded bg-zinc-900 px-2 py-0.5 text-[10px] text-white dark:bg-zinc-100 dark:text-zinc-900"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                void saveRename();
+                              }}
+                            >
+                              Ок
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded border px-2 py-0.5 text-[10px]"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setRenamingId(null);
+                              }}
+                            >
+                              Отмена
+                            </button>
+                          </span>
+                        </div>
+                      ) : (
+                        <>
+                          <span className="line-clamp-2">{c.title}</span>
+                          {!!c.updatedAt && (
+                            <span className="mt-0.5 block text-[10px] text-zinc-500">
+                              {fmtListDate(c.updatedAt)}
+                            </span>
+                          )}
+                        </>
+                      )}
+                    </button>
+                    {activeConversationId === c.id && !renamingId && (
+                      <button
+                        type="button"
+                        className="shrink-0 rounded p-2 text-zinc-500 hover:bg-zinc-200 dark:hover:bg-zinc-800"
+                        aria-label="Переименовать"
+                        disabled={busy}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenamingId(c.id);
+                          setRenameDraft(c.title);
+                        }}
+                      >
+                        ✎
+                      </button>
+                    )}
+                  </div>
                 </li>
               ))}
             </ul>
@@ -494,26 +745,24 @@ export function Workspace() {
       </aside>
 
       <section className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <header className="flex shrink-0 items-start gap-2 border-b border-zinc-200 px-3 py-3 sm:px-4 dark:border-zinc-800">
+        {status === "unauthenticated" && input.trim().length > 0 && (
+          <div className="border-b border-amber-200 bg-amber-50 px-3 py-2 text-center text-xs text-amber-950 dark:border-amber-800 dark:bg-amber-950/50 dark:text-amber-100">
+            Без аккаунта текст не сохраняется при закрытии вкладки.{" "}
+            <Link className="font-medium underline" href="/login">
+              Войти
+            </Link>
+          </div>
+        )}
+
+        <header className="flex shrink-0 flex-wrap items-start gap-2 border-b border-zinc-200 px-3 py-3 sm:px-4 dark:border-zinc-800">
           <button
             type="button"
             className="touch-manipulation mt-0.5 shrink-0 rounded-lg border border-zinc-300 p-2 text-zinc-700 md:hidden dark:border-zinc-600 dark:text-zinc-300"
             onClick={() => setNavOpen(true)}
             aria-label="Открыть настройки"
           >
-            <svg
-              className="h-5 w-5"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-              aria-hidden
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth={2}
-                d="M4 6h16M4 12h16M4 18h16"
-              />
+            <svg className="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24" aria-hidden>
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 12h16M4 18h16" />
             </svg>
           </button>
           <div className="min-w-0 flex-1">
@@ -524,7 +773,33 @@ export function Workspace() {
               {busy ? "Получаем ответ…" : WORK_PRESETS[preset].hint}
             </p>
           </div>
-          <div className="flex max-w-[50%] shrink-0 flex-wrap items-center justify-end gap-1.5 sm:gap-2">
+          <div className="flex w-full shrink-0 flex-wrap items-center justify-start gap-1.5 sm:ml-auto sm:w-auto sm:max-w-[50%] sm:justify-end sm:gap-2">
+            {messages.some((m) => m.content.trim()) && (
+              <>
+                <button
+                  type="button"
+                  onClick={() => void copyDialog()}
+                  className="touch-manipulation rounded-lg border border-zinc-300 px-2 py-1.5 text-[11px] font-medium text-zinc-700 sm:text-xs dark:border-zinc-600 dark:text-zinc-300"
+                >
+                  Копировать
+                </button>
+                <button
+                  type="button"
+                  onClick={exportMarkdown}
+                  className="touch-manipulation rounded-lg border border-zinc-300 px-2 py-1.5 text-[11px] font-medium text-zinc-700 sm:text-xs dark:border-zinc-600 dark:text-zinc-300"
+                >
+                  .md файл
+                </button>
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={busy}
+                  className="touch-manipulation rounded-lg border border-zinc-300 px-2 py-1.5 text-[11px] font-medium text-zinc-700 disabled:opacity-40 sm:text-xs dark:border-zinc-600 dark:text-zinc-300"
+                >
+                  Файл → поле
+                </button>
+              </>
+            )}
             {busy && (
               <button
                 type="button"
@@ -573,6 +848,18 @@ export function Workspace() {
         </header>
 
         <div className="min-h-0 flex-1 overflow-y-auto overscroll-y-contain px-3 py-3 sm:px-4 sm:py-4">
+          {hasMoreOlder && activeConversationId && (
+            <div className="mx-auto mb-3 max-w-3xl text-center">
+              <button
+                type="button"
+                disabled={loadingOlder || busy}
+                onClick={() => void loadOlder()}
+                className="touch-manipulation rounded-full border border-zinc-300 bg-white px-4 py-1.5 text-xs text-zinc-700 hover:bg-zinc-50 disabled:opacity-40 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200"
+              >
+                {loadingOlder ? "Загрузка…" : "Ранние сообщения"}
+              </button>
+            </div>
+          )}
           {messages.length === 0 && (
             <p className="mx-auto max-w-xl text-center text-sm text-zinc-500">
               Выберите режим в меню{" "}
@@ -586,7 +873,7 @@ export function Workspace() {
           <ul className="mx-auto flex max-w-3xl flex-col gap-3 sm:gap-4">
             {messages.map((m, i) => (
               <li
-                key={`${m.role}-${i}-${m.content.slice(0, 12)}`}
+                key={m.id ?? `${m.role}-${i}-${m.content.slice(0, 12)}`}
                 className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
               >
                 <div
@@ -597,15 +884,19 @@ export function Workspace() {
                   }`}
                 >
                   {m.content ||
-                    (busy && i === messages.length - 1 && m.role === "assistant"
-                      ? "…"
-                      : "")}
+                    (busy && i === messages.length - 1 && m.role === "assistant" ? "…" : "")}
                 </div>
               </li>
             ))}
           </ul>
           <div ref={bottomRef} />
         </div>
+
+        {filePasteHint && (
+          <div className="shrink-0 border-t border-zinc-200 bg-zinc-100 px-3 py-1.5 text-center text-xs text-zinc-600 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
+            {filePasteHint}
+          </div>
+        )}
 
         {error && (
           <div className="shrink-0 border-t border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950/40 dark:text-red-200 sm:px-4">

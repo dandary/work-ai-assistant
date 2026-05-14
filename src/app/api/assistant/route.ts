@@ -217,7 +217,7 @@ export async function POST(request: Request) {
 
   if (persist && session?.user?.id && conversationId) {
     conv = await prisma.conversation.findFirst({
-      where: { id: conversationId, userId: session.user.id },
+      where: { id: conversationId, userId: session.user.id, deletedAt: null },
       select: { id: true, title: true, userId: true },
     });
     if (!conv) {
