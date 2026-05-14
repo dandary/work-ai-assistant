@@ -260,14 +260,26 @@ export function Workspace() {
       return;
     }
     if (!activeConversationId) return;
+    setError(null);
     const id = activeConversationId;
     const res = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
       method: "DELETE",
+      credentials: "same-origin",
     });
-    if (!res.ok) return;
-    const list = await refetchConversations(chatQuery);
+    if (!res.ok) {
+      const data = (await res.json().catch(() => null)) as { error?: string } | null;
+      setError(data?.error || `Не удалось удалить чат (${res.status})`);
+      return;
+    }
+    let remainingAfterDelete: ConversationListItem[] = [];
+    setConversations((prev) => {
+      remainingAfterDelete = prev.filter((c) => c.id !== id);
+      return remainingAfterDelete;
+    });
+    const refreshed = await refetchConversations(chatQuery);
+    const list = refreshed ?? remainingAfterDelete;
     setRenamingId(null);
-    if (list && list.length > 0) {
+    if (list.length > 0) {
       const next = list[0]!;
       setActiveConversationId(next.id);
       await loadConversation(next.id);
@@ -813,7 +825,7 @@ export function Workspace() {
               <button
                 type="button"
                 onClick={() => void deleteActiveChat()}
-                disabled={busy || !activeConversationId}
+                disabled={!activeConversationId}
                 className="touch-manipulation rounded-lg border border-zinc-300 px-2 py-1.5 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 sm:text-xs dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
                 <span className="sm:hidden">Удал.</span>
