@@ -14,6 +14,8 @@ import {
   WORK_PRESETS,
   type WorkPresetId,
 } from "@/lib/presets";
+import { ChatMessageBubble } from "@/components/chat-message-bubble";
+import { ConfirmDialog } from "@/components/confirm-dialog";
 
 type ChatMessage = { id?: string; role: "user" | "assistant"; content: string };
 
@@ -75,6 +77,8 @@ export function Workspace() {
   );
   const [bootstrapping, setBootstrapping] = useState(true);
   const [navOpen, setNavOpen] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const bottomRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -252,14 +256,20 @@ export function Workspace() {
 
   const deleteActiveChat = useCallback(async () => {
     abortRef.current?.abort();
+    setDeleteBusy(true);
     if (status !== "authenticated") {
       setMessages([]);
       setError(null);
       setHasMoreOlder(false);
       setOldestMessageId(null);
+      setDeleteConfirmOpen(false);
+      setDeleteBusy(false);
       return;
     }
-    if (!activeConversationId) return;
+    if (!activeConversationId) {
+      setDeleteBusy(false);
+      return;
+    }
     setError(null);
     const id = activeConversationId;
     const res = await fetch(`/api/conversations/${encodeURIComponent(id)}`, {
@@ -269,6 +279,8 @@ export function Workspace() {
     if (!res.ok) {
       const data = (await res.json().catch(() => null)) as { error?: string } | null;
       setError(data?.error || `Не удалось удалить чат (${res.status})`);
+      setDeleteConfirmOpen(false);
+      setDeleteBusy(false);
       return;
     }
     let remainingAfterDelete: ConversationListItem[] = [];
@@ -301,6 +313,8 @@ export function Workspace() {
         setOldestMessageId(null);
       }
     }
+    setDeleteConfirmOpen(false);
+    setDeleteBusy(false);
   }, [
     activeConversationId,
     loadConversation,
@@ -564,6 +578,15 @@ export function Workspace() {
 
   return (
     <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden md:flex-row">
+      <ConfirmDialog
+        open={deleteConfirmOpen}
+        title="Удалить чат?"
+        message="Чат будет скрыт из списка. Это действие нельзя отменить из интерфейса."
+        confirmLabel="Удалить"
+        busy={deleteBusy}
+        onCancel={() => !deleteBusy && setDeleteConfirmOpen(false)}
+        onConfirm={() => void deleteActiveChat()}
+      />
       <input
         ref={fileInputRef}
         type="file"
@@ -824,8 +847,8 @@ export function Workspace() {
             {isAuthed && (
               <button
                 type="button"
-                onClick={() => void deleteActiveChat()}
-                disabled={!activeConversationId}
+                onClick={() => setDeleteConfirmOpen(true)}
+                disabled={!activeConversationId || deleteBusy}
                 className="touch-manipulation rounded-lg border border-zinc-300 px-2 py-1.5 text-[11px] font-medium text-zinc-700 hover:bg-zinc-100 disabled:opacity-40 sm:text-xs dark:border-zinc-600 dark:text-zinc-300 dark:hover:bg-zinc-800"
               >
                 <span className="sm:hidden">Удал.</span>
@@ -888,16 +911,13 @@ export function Workspace() {
                 key={m.id ?? `${m.role}-${i}-${m.content.slice(0, 12)}`}
                 className={`flex ${m.role === "user" ? "justify-end" : "justify-start"}`}
               >
-                <div
-                  className={`max-w-[min(100%,36rem)] rounded-2xl px-3 py-3 text-sm leading-relaxed whitespace-pre-wrap sm:px-4 ${
-                    m.role === "user"
-                      ? "bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900"
-                      : "border border-zinc-200 bg-white text-zinc-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-100"
-                  }`}
-                >
-                  {m.content ||
-                    (busy && i === messages.length - 1 && m.role === "assistant" ? "…" : "")}
-                </div>
+                <ChatMessageBubble
+                  role={m.role}
+                  content={m.content}
+                  streaming={
+                    busy && i === messages.length - 1 && m.role === "assistant" && !m.content
+                  }
+                />
               </li>
             ))}
           </ul>

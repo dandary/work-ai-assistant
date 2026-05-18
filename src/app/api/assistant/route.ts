@@ -11,6 +11,7 @@ import {
   DEFAULT_CEREBRAS_MODEL,
 } from "@/lib/cerebras-models";
 import { prisma } from "@/lib/prisma";
+import { persistConversationTurn } from "@/lib/persist-conversation-messages";
 import { checkRateLimit } from "@/lib/rate-limit";
 import {
   DEFAULT_PRESET,
@@ -146,11 +147,17 @@ function resolveModel(bodyModel: unknown): string {
   return trimEnvValue(process.env.CEREBRAS_MODEL) ?? DEFAULT_CEREBRAS_MODEL;
 }
 
-function parseRateLimit(): { max: number; windowMs: number; disabled: boolean } {
+function parseRateLimit(): {
+  max: number;
+  guestMax: number;
+  windowMs: number;
+  disabled: boolean;
+} {
   const disabled =
     trimEnvValue(process.env.ASSISTANT_RATE_LIMIT_DISABLED) === "1" ||
     process.env.ASSISTANT_RATE_LIMIT_DISABLED === "true";
   const maxRaw = Number.parseInt(process.env.ASSISTANT_RATE_LIMIT_MAX ?? "60", 10);
+  const guestRaw = Number.parseInt(process.env.ASSISTANT_GUEST_RATE_LIMIT_MAX ?? "20", 10);
   const winRaw = Number.parseInt(
     process.env.ASSISTANT_RATE_LIMIT_WINDOW_MS ?? "60000",
     10,
@@ -158,6 +165,7 @@ function parseRateLimit(): { max: number; windowMs: number; disabled: boolean } 
   return {
     disabled,
     max: Number.isFinite(maxRaw) ? Math.min(Math.max(maxRaw, 5), 1000) : 60,
+    guestMax: Number.isFinite(guestRaw) ? Math.min(Math.max(guestRaw, 3), 200) : 20,
     windowMs: Number.isFinite(winRaw) ? Math.min(Math.max(winRaw, 5000), 3_600_000) : 60_000,
   };
 }
@@ -212,13 +220,13 @@ export async function POST(request: Request) {
   const persist = Boolean(session?.user?.id && conversationId);
 
   let conv:
-    | { id: string; title: string; userId: string }
+    | { id: string; title: string; userId: string; summary: string | null }
     | null = null;
 
   if (persist && session?.user?.id && conversationId) {
     conv = await prisma.conversation.findFirst({
       where: { id: conversationId, userId: session.user.id, deletedAt: null },
-      select: { id: true, title: true, userId: true },
+      select: { id: true, title: true, userId: true, summary: true },
     });
     if (!conv) {
       return NextResponse.json(
@@ -230,10 +238,12 @@ export async function POST(request: Request) {
 
   const rl = parseRateLimit();
   if (!rl.disabled) {
+    const guest = !session?.user?.id;
+    const max = guest ? Math.min(rl.max, rl.guestMax) : rl.max;
     const key = session?.user?.id
       ? `assistant:${session.user.id}`
       : `assistant:${getClientIp(request)}`;
-    const hit = checkRateLimit(key, rl.max, rl.windowMs);
+    const hit = checkRateLimit(key, max, rl.windowMs);
     if (!hit.ok) {
       return NextResponse.json(
         {
@@ -251,7 +261,11 @@ export async function POST(request: Request) {
   }
 
   const presetId = isPresetId(preset) ? preset : DEFAULT_PRESET;
-  const system = WORK_PRESETS[presetId].system;
+  let system = WORK_PRESETS[presetId].system;
+  const summaryCtx = conv?.summary?.trim();
+  if (summaryCtx) {
+    system += `\n\nКраткий контекст ранее обсуждённого (для длинного диалога):\n${summaryCtx}`;
+  }
   const model = resolveModel(bodyModel);
 
   const baseURL = trimEnvValue(process.env.CEREBRAS_API_BASE_URL) ?? CEREBRAS_BASE_URL;
@@ -326,29 +340,18 @@ export async function POST(request: Request) {
                   : undefined;
 
               await prisma.$transaction(async (tx) => {
-                await tx.message.deleteMany({ where: { conversationId } });
-                await tx.message.createMany({
-                  data: [
-                    ...normalized.map((m) => ({
-                      conversationId,
-                      role: m.role,
-                      content: m.content,
-                    })),
-                    {
-                      conversationId,
-                      role: "assistant",
-                      content: assistantText,
-                    },
-                  ],
-                });
-                await tx.conversation.update({
-                  where: { id: conversationId },
-                  data: {
-                    preset: presetId,
+                await persistConversationTurn(
+                  tx,
+                  conversationId,
+                  normalized,
+                  assistantText,
+                  {
+                    presetId,
                     modelId: model,
-                    ...(newTitle ? { title: newTitle } : {}),
+                    newTitle,
+                    refreshSummary: true,
                   },
-                });
+                );
               });
             } catch (persistErr) {
               console.error("assistant persist", persistErr);

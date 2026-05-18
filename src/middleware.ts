@@ -14,7 +14,8 @@ export async function middleware(request: NextRequest) {
     pathname === "/forgot-password" ||
     pathname === "/reset-password" ||
     pathname.startsWith("/api/auth/") ||
-    pathname === "/api/assistant";
+    pathname === "/api/assistant" ||
+    pathname === "/api/health";
 
   if (isPublic) {
     return NextResponse.next();
